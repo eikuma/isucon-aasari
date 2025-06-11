@@ -172,45 +172,179 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
+
+	// Extract post IDs for batch operations
+	postIDs := make([]int, len(results))
+	for i, p := range results {
+		postIDs[i] = p.ID
+	}
+
+	// Create IN clause placeholder
+	placeholder := strings.Repeat("?,", len(postIDs)-1) + "?"
+	args := make([]interface{}, len(postIDs))
+	for i, id := range postIDs {
+		args[i] = id
+	}
+
+	// 1. Get comment counts using INNER JOIN
+	type CommentCountResult struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	commentCounts := make(map[int]int)
+	var countResults []CommentCountResult
+	countQuery := fmt.Sprintf(`
+		SELECT p.id AS post_id, COUNT(c.id) AS count
+		FROM posts p
+		LEFT JOIN comments c ON p.id = c.post_id
+		WHERE p.id IN (%s)
+		GROUP BY p.id`, placeholder)
+	
+	err := db.Select(&countResults, countQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, cr := range countResults {
+		commentCounts[cr.PostID] = cr.Count
+	}
+
+	// 2. Get comments with users using INNER JOIN
+	type CommentWithUser struct {
+		Comment
+		UserID       int    `db:"user_id"`
+		UserAccount  string `db:"user_account_name"`
+		UserNickname string `db:"user_nickname"`
+		UserEmail    string `db:"user_email"`
+		UserPassword string `db:"user_passhash"`
+		UserDelFlg   int    `db:"user_del_flg"`
+		UserCreated  time.Time `db:"user_created_at"`
+	}
+	
+	commentsMap := make(map[int][]Comment)
+	var commentResults []CommentWithUser
+	
+	var commentsQuery string
+	if allComments {
+		commentsQuery = fmt.Sprintf(`
+			SELECT 
+				c.id, c.post_id, c.user_id, c.comment, c.created_at,
+				u.id AS user_id, u.account_name AS user_account_name, 
+				u.nickname AS user_nickname, u.email AS user_email,
+				u.passhash AS user_password, u.del_flg AS user_del_flg, 
+				u.created_at AS user_created_at
+			FROM comments c
+			INNER JOIN users u ON c.user_id = u.id
+			WHERE c.post_id IN (%s)
+			ORDER BY c.post_id, c.created_at DESC`, placeholder)
+	} else {
+		// For limited comments, we need a subquery to get only top 3 per post
+		commentsQuery = fmt.Sprintf(`
+			SELECT 
+				c.id, c.post_id, c.user_id, c.comment, c.created_at,
+				u.id AS user_id, u.account_name AS user_account_name, 
+				u.nickname AS user_nickname, u.email AS user_email,
+				u.passhash AS user_password, u.del_flg AS user_del_flg, 
+				u.created_at AS user_created_at
+			FROM (
+				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
+				FROM comments
+				WHERE post_id IN (%s)
+			) c
+			INNER JOIN users u ON c.user_id = u.id
+			WHERE c.rn <= 3
+			ORDER BY c.post_id, c.created_at DESC`, placeholder)
+	}
+
+	err = db.Select(&commentResults, commentsQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, cr := range commentResults {
+		comment := Comment{
+			ID:        cr.Comment.ID,
+			PostID:    cr.Comment.PostID,
+			UserID:    cr.Comment.UserID,
+			Comment:   cr.Comment.Comment,
+			CreatedAt: cr.Comment.CreatedAt,
+			User: User{
+				ID:          cr.UserID,
+				AccountName: cr.UserAccount,
+				Nickname:    cr.UserNickname,
+				Email:       cr.UserEmail,
+				Passhash:    cr.UserPassword,
+				DelFlg:      cr.UserDelFlg,
+				CreatedAt:   cr.UserCreated,
+			},
+		}
+		commentsMap[cr.PostID] = append(commentsMap[cr.PostID], comment)
+	}
+
+	// 3. Get post users using INNER JOIN
+	type PostUserResult struct {
+		PostID       int       `db:"post_id"`
+		UserID       int       `db:"user_id"`
+		UserAccount  string    `db:"user_account_name"`
+		UserNickname string    `db:"user_nickname"`
+		UserEmail    string    `db:"user_email"`
+		UserPassword string    `db:"user_passhash"`
+		UserDelFlg   int       `db:"user_del_flg"`
+		UserCreated  time.Time `db:"user_created_at"`
+	}
+
+	postUsersMap := make(map[int]User)
+	var userResults []PostUserResult
+	userQuery := fmt.Sprintf(`
+		SELECT 
+			p.id AS post_id, u.id AS user_id, u.account_name AS user_account_name,
+			u.nickname AS user_nickname, u.email AS user_email,
+			u.passhash AS user_passhash, u.del_flg AS user_del_flg,
+			u.created_at AS user_created_at
+		FROM posts p
+		INNER JOIN users u ON p.user_id = u.id
+		WHERE p.id IN (%s)`, placeholder)
+
+	err = db.Select(&userResults, userQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ur := range userResults {
+		postUsersMap[ur.PostID] = User{
+			ID:          ur.UserID,
+			AccountName: ur.UserAccount,
+			Nickname:    ur.UserNickname,
+			Email:       ur.UserEmail,
+			Passhash:    ur.UserPassword,
+			DelFlg:      ur.UserDelFlg,
+			CreatedAt:   ur.UserCreated,
+		}
+	}
+
+	// 4. Assemble the final posts
 	var posts []Post
-
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
+		// Set comment count
+		p.CommentCount = commentCounts[p.ID]
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// reverse
+		// Set comments (reverse order for display)
+		comments := commentsMap[p.ID]
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
+		// Set user
+		if user, exists := postUsersMap[p.ID]; exists {
+			p.User = user
 		}
 
 		p.CSRFToken = csrfToken
 
+		// Only include posts from non-deleted users
 		if p.User.DelFlg == 0 {
 			posts = append(posts, p)
 		}
