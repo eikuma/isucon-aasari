@@ -1,0 +1,23 @@
+# /home/isucon/tool-config/alp/config.yml
+
+# 除外するパス（静的ファイルなど）
+filters:
+  - 'request_uri ~* \.(css|js|png|jpg|jpeg|gif|ico)$'
+
+# 集計の単位（URLのクエリなどを正規化）
+normalize: true
+
+# グルーピングルール（パスを共通化）
+group_by: request_uri
+
+# 上位N件のみ表示
+limit: 50
+
+# ソート対象（count, sum, avg など）
+sort: sum
+
+# スロークエリのしきい値（任意）
+# slow_threshold: 1.0
+
+# ログフォーマット（明示しないと LTSV assumed）
+# format: ltsv
