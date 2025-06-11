@@ -344,10 +344,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 		p.CSRFToken = csrfToken
 
-		// Only include posts from non-deleted users
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		// Add post to results (deleted user check already done in query)
+		posts = append(posts, p)
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -520,7 +518,15 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	// Only fetch posts from non-deleted users and limit to what we actually need
+	// This pre-filters deleted users and limits the dataset early
+	err := db.Select(&results, `
+		SELECT p.id, p.user_id, p.body, p.mime, p.created_at 
+		FROM posts p 
+		INNER JOIN users u ON p.user_id = u.id 
+		WHERE u.del_flg = 0 
+		ORDER BY p.created_at DESC 
+		LIMIT ?`, postsPerPage*2) // Fetch a bit more than needed to account for edge cases
 	if err != nil {
 		log.Print(err)
 		return
@@ -566,7 +572,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -654,7 +660,13 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	err = db.Select(&results, `
+		SELECT p.id, p.user_id, p.body, p.mime, p.created_at 
+		FROM posts p 
+		INNER JOIN users u ON p.user_id = u.id 
+		WHERE p.created_at <= ? AND u.del_flg = 0 
+		ORDER BY p.created_at DESC 
+		LIMIT ?`, t.Format(ISO8601Format), postsPerPage*2)
 	if err != nil {
 		log.Print(err)
 		return
