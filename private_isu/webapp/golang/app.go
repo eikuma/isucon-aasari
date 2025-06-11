@@ -381,7 +381,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	// 2. Get comments with users using INNER JOIN
 	type CommentWithUser struct {
 		Comment
-		UserID        int       `db:"user_id"`
+		CommentUserID int       `db:"comment_user_id"`
 		UserAccount   string    `db:"user_account_name"`
 		UserPassword  string    `db:"user_passhash"`
 		UserAuthority int       `db:"user_authority"`
@@ -397,8 +397,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		commentsQuery = fmt.Sprintf(`
 			SELECT 
 				c.id, c.post_id, c.user_id, c.comment, c.created_at,
-				u.id AS user_id, u.account_name AS user_account_name, 
-				u.passhash AS user_password, u.authority AS user_authority,
+				u.id AS comment_user_id, u.account_name AS user_account_name, 
+				u.passhash AS user_passhash, u.authority AS user_authority,
 				u.del_flg AS user_del_flg, u.created_at AS user_created_at
 			FROM comments c
 			INNER JOIN users u ON c.user_id = u.id
@@ -409,8 +409,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		commentsQuery = fmt.Sprintf(`
 			SELECT 
 				c.id, c.post_id, c.user_id, c.comment, c.created_at,
-				u.id AS user_id, u.account_name AS user_account_name, 
-				u.passhash AS user_password, u.authority AS user_authority,
+				u.id AS comment_user_id, u.account_name AS user_account_name, 
+				u.passhash AS user_passhash, u.authority AS user_authority,
 				u.del_flg AS user_del_flg, u.created_at AS user_created_at
 			FROM (
 				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
@@ -435,7 +435,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			Comment:   cr.Comment.Comment,
 			CreatedAt: cr.Comment.CreatedAt,
 			User: User{
-				ID:          cr.UserID,
+				ID:          cr.CommentUserID,
 				AccountName: cr.UserAccount,
 				Passhash:    cr.UserPassword,
 				Authority:   cr.UserAuthority,
@@ -800,41 +800,44 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	// Optimize: Get all user statistics in a single query using JOINs and subqueries
+	type UserStats struct {
+		CommentCount   int `db:"comment_count"`
+		PostCount      int `db:"post_count"`
+		CommentedCount int `db:"commented_count"`
+	}
+
+	var stats UserStats
+	err = db.Get(&stats, `
+		SELECT 
+			COALESCE(comment_stats.comment_count, 0) AS comment_count,
+			COALESCE(post_stats.post_count, 0) AS post_count,
+			COALESCE(commented_stats.commented_count, 0) AS commented_count
+		FROM (SELECT 1) dummy
+		LEFT JOIN (
+			SELECT COUNT(*) AS comment_count 
+			FROM comments 
+			WHERE user_id = ?
+		) comment_stats ON 1=1
+		LEFT JOIN (
+			SELECT COUNT(*) AS post_count 
+			FROM posts 
+			WHERE user_id = ?
+		) post_stats ON 1=1
+		LEFT JOIN (
+			SELECT COUNT(*) AS commented_count 
+			FROM comments c 
+			INNER JOIN posts p ON c.post_id = p.id 
+			WHERE p.user_id = ?
+		) commented_stats ON 1=1`, user.ID, user.ID, user.ID)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	postCount := len(postIDs)
-
-	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-	}
+	commentCount := stats.CommentCount
+	postCount := stats.PostCount
+	commentedCount := stats.CommentedCount
 
 	me := getSessionUser(r)
 
@@ -918,7 +921,8 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	// Only fetch necessary fields, not the large imgdata field
+	err = db.Select(&results, "SELECT id, user_id, body, mime, created_at FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
