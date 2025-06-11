@@ -37,7 +37,8 @@ deploy-conf: check-server-id deploy-db-conf deploy-nginx-conf deploy-service-fil
 
 # ベンチマークを走らせる直前に実行する
 .PHONY: bench
-bench: curl https://xnvvb925bl.execute-api.ap-northeast-1.amazonaws.com/
+bench: 
+	curl https://xnvvb925bl.execute-api.ap-northeast-1.amazonaws.com/
 
 # slow queryを確認する
 .PHONY: slow-query
