@@ -19,3 +19,4 @@ sort: sum
 
 # ログフォーマット（明示しないと LTSV assumed）
 # format: ltsv
+log_format: combined
