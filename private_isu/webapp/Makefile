@@ -14,7 +14,7 @@ NGINX_PATH:=/etc/nginx
 SYSTEMD_PATH:=/etc/systemd/system
 
 NGINX_LOG:=/var/log/nginx/access.log
-DB_SLOW_LOG:=/var/log/mysql/mysql-slow.log
+DB_SLOW_LOG:=/var/log/mysql/mariadb-slow.log
 
 MYSQL_USER:=isuconp
 MYSQL_PASS:=isuconp
@@ -37,8 +37,7 @@ deploy-conf: check-server-id deploy-db-conf deploy-nginx-conf deploy-service-fil
 
 # ベンチマークを走らせる直前に実行する
 .PHONY: bench
-bench: 
-	curl https://xnvvb925bl.execute-api.ap-northeast-1.amazonaws.com/
+bench: check-server-id mv-logs build deploy-conf restart watch-service-log
 
 # slow queryを確認する
 .PHONY: slow-query
