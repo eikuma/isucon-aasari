@@ -14,7 +14,7 @@ NGINX_PATH:=/etc/nginx
 SYSTEMD_PATH:=/etc/systemd/system
 
 NGINX_LOG:=/var/log/nginx/access.log
-DB_SLOW_LOG:=/var/log/mysql/mariadb-slow.log
+DB_SLOW_LOG:=/var/log/mysql/mysql-slow.log
 
 MYSQL_USER:=isuconp
 MYSQL_PASS:=isuconp
