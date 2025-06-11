@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	crand "crypto/rand"
+	"encoding/gob"
 	"fmt"
 	"html/template"
 	"io"
@@ -74,6 +76,11 @@ func init() {
 	memcacheClient := memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	gob.Register(Post{})
+	gob.Register([]Post{})
+	gob.Register(Comment{})
+	gob.Register([]Comment{})
+	gob.Register(User{})
 }
 
 func dbInitialize() {
@@ -171,46 +178,80 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
+func getCachedDataGob[T any](mc *memcache.Client, key string, dbQueryFunc func() (T, error), expiration int32) (T, error) {
+	var data T
+	item, err := mc.Get(key)
+	if err == nil && item != nil {
+		buffer := bytes.NewReader(item.Value)
+		decoder := gob.NewDecoder(buffer)
+		err = decoder.Decode(&data)
+		if err == nil {
+			return data, nil
+		}
+	}
+	// キャッシュがないかデコードエラーの場合、DBから取得
+	data, err = dbQueryFunc()
+	if err != nil {
+		return data, err
+	}
+	// キャッシュに保存
+	var buffer bytes.Buffer
+	encoder := gob.NewEncoder(&buffer)
+	err = encoder.Encode(data)
+	if err == nil {
+		mc.Set(&memcache.Item{Key: key, Value: buffer.Bytes(), Expiration: expiration})
+	}
+	return data, nil
+}
+
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
-
+	var err error
+	mc := memcache.New("127.0.0.1:11211")
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		commentCountKey := fmt.Sprintf("post:%d:comment_count", p.ID)
+		p.CommentCount, err = getCachedDataGob(mc, commentCountKey, func() (int, error) {
+			var count int
+			err := db.Get(&count, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+			return count, err
+		}, 60)
 		if err != nil {
 			return nil, err
 		}
-
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+		commentsKey := fmt.Sprintf("post:%d:comments:%t", p.ID, allComments)
+		p.Comments, err = getCachedDataGob(mc, commentsKey, func() ([]Comment, error) {
+			query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+			if !allComments {
+				query += " LIMIT 3"
+			}
+			var comments []Comment
+			err := db.Select(&comments, query, p.ID)
+			return comments, err
+		}, 60)
 		if err != nil {
 			return nil, err
 		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+		for i := range p.Comments {
+			userKey := fmt.Sprintf("user:%d", p.Comments[i].UserID)
+			p.Comments[i].User, err = getCachedDataGob(mc, userKey, func() (User, error) {
+				var user User
+				err := db.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", p.Comments[i].UserID)
+				return user, err
+			}, 60*5)
 			if err != nil {
 				return nil, err
 			}
 		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		userKey := fmt.Sprintf("user:%d", p.UserID)
+		p.User, err = getCachedDataGob(mc, userKey, func() (User, error) {
+			var user User
+			err := db.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+			return user, err
+		}, 60*5)
 		if err != nil {
 			return nil, err
 		}
-
 		p.CSRFToken = csrfToken
-
 		if p.User.DelFlg == 0 {
 			posts = append(posts, p)
 		}
@@ -218,7 +259,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			break
 		}
 	}
-
 	return posts, nil
 }
 
@@ -512,35 +552,54 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	if maxCreatedAt == "" {
 		return
 	}
-
 	t, err := time.Parse(ISO8601Format, maxCreatedAt)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-
-	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
-	if err != nil {
-		log.Print(err)
-		return
+	mc := memcache.New("127.0.0.1:11211")
+	cacheKey := fmt.Sprintf("posts:%s", t.Format(ISO8601Format))
+	item, err := mc.Get(cacheKey)
+	var results []Post
+	if err == nil && item != nil {
+		buffer := bytes.NewReader(item.Value)
+		decoder := gob.NewDecoder(buffer)
+		err = decoder.Decode(&results)
+		if err != nil {
+			log.Print("Failed to decode cache data:", err)
+			results = nil
+		}
 	}
-
+	if len(results) == 0 {
+		err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+		if err != nil {
+			log.Print(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var buffer bytes.Buffer
+		encoder := gob.NewEncoder(&buffer)
+		err := encoder.Encode(results)
+		if err == nil {
+			mc.Set(&memcache.Item{
+				Key:        cacheKey,
+				Value:      buffer.Bytes(),
+				Expiration: 60 * 5,
+			})
+		}
+	}
 	posts, err := makePosts(results, getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-
 	if len(posts) == 0 {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-
 	fmap := template.FuncMap{
 		"imageURL": imageURL,
 	}
-
 	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
 		getTemplPath("posts.html"),
 		getTemplPath("post.html"),
