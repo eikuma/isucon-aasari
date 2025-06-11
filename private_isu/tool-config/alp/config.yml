@@ -1,8 +1,7 @@
 # /home/isucon/tool-config/alp/config.yml
 
 # 除外するパス（静的ファイルなど）
-filters:
-  - 'request_uri ~* \.(css|js|png|jpg|jpeg|gif|ico)$'
+filters: 'request_uri ~* \.(css|js|png|jpg|jpeg|gif|ico)$'
 
 # 集計の単位（URLのクエリなどを正規化）
 normalize: true
