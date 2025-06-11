@@ -293,74 +293,233 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
 
-	for _, p := range results {
-		// Try to get comment count from cache first
-		commentCount, err := getCommentCountFromCache(p.ID)
-		if err != nil {
-			// Cache miss, fetch from database
-			err = db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-			if err != nil {
-				return nil, err
-			}
-			// Store in cache for next time
-			setCommentCountCache(p.ID, commentCount)
-		}
-		p.CommentCount = commentCount
+	// Extract post IDs for batch operations
+	postIDs := make([]int, len(results))
+	for i, p := range results {
+		postIDs[i] = p.ID
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
+	// Create IN clause placeholder
+	placeholder := strings.Repeat("?,", len(postIDs)-1) + "?"
+	args := make([]interface{}, len(postIDs))
+	for i, id := range postIDs {
+		args[i] = id
+	}
+
+	// 1. Get comment counts using LEFT JOIN (with cache fallback)
+	type CommentCountResult struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	commentCounts := make(map[int]int)
+
+	// Try to get counts from cache first
+	missedPostIDs := []int{}
+	for _, postID := range postIDs {
+		if count, err := getCommentCountFromCache(postID); err == nil {
+			commentCounts[postID] = count
+		} else {
+			missedPostIDs = append(missedPostIDs, postID)
 		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+	}
+
+	// Fetch missed counts from database in batch
+	if len(missedPostIDs) > 0 {
+		missedPlaceholder := strings.Repeat("?,", len(missedPostIDs)-1) + "?"
+		missedArgs := make([]interface{}, len(missedPostIDs))
+		for i, id := range missedPostIDs {
+			missedArgs[i] = id
+		}
+
+		var countResults []CommentCountResult
+		countQuery := fmt.Sprintf(`
+			SELECT p.id AS post_id, COUNT(c.id) AS count
+			FROM posts p
+			LEFT JOIN comments c ON p.id = c.post_id
+			WHERE p.id IN (%s)
+			GROUP BY p.id`, missedPlaceholder)
+
+		err := db.Select(&countResults, countQuery, missedArgs...)
 		if err != nil {
 			return nil, err
 		}
 
-		for i := 0; i < len(comments); i++ {
-			// Try to get user from cache first
-			user, err := getUserFromCache(comments[i].UserID)
-			if err != nil {
-				// Cache miss, fetch from database
-				err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-				if err != nil {
-					return nil, err
-				}
-				// Store in cache for next time
-				setUserCache(&comments[i].User)
-			} else {
-				comments[i].User = *user
-			}
+		for _, cr := range countResults {
+			commentCounts[cr.PostID] = cr.Count
+			// Cache the result
+			setCommentCountCache(cr.PostID, cr.Count)
+		}
+	}
+
+	// 2. Get comments with users using INNER JOIN
+	type CommentWithUser struct {
+		Comment
+		UserID        int       `db:"user_id"`
+		UserAccount   string    `db:"user_account_name"`
+		UserPassword  string    `db:"user_passhash"`
+		UserAuthority int       `db:"user_authority"`
+		UserDelFlg    int       `db:"user_del_flg"`
+		UserCreated   time.Time `db:"user_created_at"`
+	}
+
+	commentsMap := make(map[int][]Comment)
+	var commentResults []CommentWithUser
+
+	var commentsQuery string
+	if allComments {
+		commentsQuery = fmt.Sprintf(`
+			SELECT 
+				c.id, c.post_id, c.user_id, c.comment, c.created_at,
+				u.id AS user_id, u.account_name AS user_account_name, 
+				u.passhash AS user_password, u.authority AS user_authority,
+				u.del_flg AS user_del_flg, u.created_at AS user_created_at
+			FROM comments c
+			INNER JOIN users u ON c.user_id = u.id
+			WHERE c.post_id IN (%s)
+			ORDER BY c.post_id, c.created_at DESC`, placeholder)
+	} else {
+		// For limited comments, use window function to get only top 3 per post
+		commentsQuery = fmt.Sprintf(`
+			SELECT 
+				c.id, c.post_id, c.user_id, c.comment, c.created_at,
+				u.id AS user_id, u.account_name AS user_account_name, 
+				u.passhash AS user_password, u.authority AS user_authority,
+				u.del_flg AS user_del_flg, u.created_at AS user_created_at
+			FROM (
+				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
+				FROM comments
+				WHERE post_id IN (%s)
+			) c
+			INNER JOIN users u ON c.user_id = u.id
+			WHERE c.rn <= 3
+			ORDER BY c.post_id, c.created_at DESC`, placeholder)
+	}
+
+	err := db.Select(&commentResults, commentsQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, cr := range commentResults {
+		comment := Comment{
+			ID:        cr.Comment.ID,
+			PostID:    cr.Comment.PostID,
+			UserID:    cr.Comment.UserID,
+			Comment:   cr.Comment.Comment,
+			CreatedAt: cr.Comment.CreatedAt,
+			User: User{
+				ID:          cr.UserID,
+				AccountName: cr.UserAccount,
+				Passhash:    cr.UserPassword,
+				Authority:   cr.UserAuthority,
+				DelFlg:      cr.UserDelFlg,
+				CreatedAt:   cr.UserCreated,
+			},
+		}
+		commentsMap[cr.PostID] = append(commentsMap[cr.PostID], comment)
+
+		// Cache the user data
+		setUserCache(&comment.User)
+	}
+
+	// 3. Get post users using INNER JOIN (with cache fallback)
+	postUsersMap := make(map[int]User)
+	missedUserIDs := []int{}
+
+	// Try to get users from cache first
+	for _, p := range results {
+		if user, err := getUserFromCache(p.UserID); err == nil {
+			postUsersMap[p.ID] = *user
+		} else {
+			missedUserIDs = append(missedUserIDs, p.UserID)
+		}
+	}
+
+	// Fetch missed users from database in batch
+	if len(missedUserIDs) > 0 {
+		// Remove duplicates
+		uniqueUserIDs := make(map[int]bool)
+		for _, id := range missedUserIDs {
+			uniqueUserIDs[id] = true
 		}
 
-		// reverse
+		userIDsList := make([]int, 0, len(uniqueUserIDs))
+		for id := range uniqueUserIDs {
+			userIDsList = append(userIDsList, id)
+		}
+
+		userArgs := make([]interface{}, len(userIDsList))
+		for i, id := range userIDsList {
+			userArgs[i] = id
+		}
+
+		type PostUserResult struct {
+			PostID        int       `db:"post_id"`
+			UserID        int       `db:"user_id"`
+			UserAccount   string    `db:"user_account_name"`
+			UserPassword  string    `db:"user_passhash"`
+			UserAuthority int       `db:"user_authority"`
+			UserDelFlg    int       `db:"user_del_flg"`
+			UserCreated   time.Time `db:"user_created_at"`
+		}
+
+		var userResults []PostUserResult
+		userQuery := fmt.Sprintf(`
+			SELECT 
+				p.id AS post_id, u.id AS user_id, u.account_name AS user_account_name,
+				u.passhash AS user_passhash, u.authority AS user_authority,
+				u.del_flg AS user_del_flg, u.created_at AS user_created_at
+			FROM posts p
+			INNER JOIN users u ON p.user_id = u.id
+			WHERE p.id IN (%s)`, placeholder)
+
+		err = db.Select(&userResults, userQuery, args...)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, ur := range userResults {
+			user := User{
+				ID:          ur.UserID,
+				AccountName: ur.UserAccount,
+				Passhash:    ur.UserPassword,
+				Authority:   ur.UserAuthority,
+				DelFlg:      ur.UserDelFlg,
+				CreatedAt:   ur.UserCreated,
+			}
+			postUsersMap[ur.PostID] = user
+
+			// Cache the user data
+			setUserCache(&user)
+		}
+	}
+
+	// 4. Assemble the final posts
+	var posts []Post
+	for _, p := range results {
+		// Set comment count
+		p.CommentCount = commentCounts[p.ID]
+
+		// Set comments (reverse order for display)
+		comments := commentsMap[p.ID]
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-
 		p.Comments = comments
 
-		// Try to get post user from cache first
-		user, err := getUserFromCache(p.UserID)
-		if err != nil {
-			// Cache miss, fetch from database
-			err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-			if err != nil {
-				return nil, err
-			}
-			// Store in cache for next time
-			setUserCache(&p.User)
-		} else {
-			p.User = *user
+		// Set user
+		if user, exists := postUsersMap[p.ID]; exists {
+			p.User = user
 		}
 
 		p.CSRFToken = csrfToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		// Add post to results (deleted user check already done in query)
+		posts = append(posts, p)
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -529,20 +688,43 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
+	session := getSession(r)
 	me := getSessionUser(r)
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
+	// Only fetch posts from non-deleted users and limit to what we actually need
+	// This pre-filters deleted users and limits the dataset early
+	err := db.Select(&results, `
+		SELECT p.id, p.user_id, p.body, p.mime, p.created_at 
+		FROM posts p 
+		INNER JOIN users u ON p.user_id = u.id 
+		WHERE u.del_flg = 0 
+		ORDER BY p.created_at DESC 
+		LIMIT ?`, postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	// Get CSRF token from the already retrieved session
+	var csrfToken string
+	if token, ok := session.Values["csrf_token"]; ok {
+		csrfToken = token.(string)
+	}
+
+	posts, err := makePosts(results, csrfToken, false)
 	if err != nil {
 		log.Print(err)
 		return
+	}
+
+	// Get flash message from the already retrieved session
+	var flash string
+	if value, ok := session.Values["notice"]; ok && value != nil {
+		flash = value.(string)
+		delete(session.Values, "notice")
+		session.Save(r, w)
 	}
 
 	fmap := template.FuncMap{
@@ -559,7 +741,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		Me        User
 		CSRFToken string
 		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	}{posts, me, csrfToken, flash})
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -667,7 +849,13 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
+	err = db.Select(&results, `
+		SELECT p.id, p.user_id, p.body, p.mime, p.created_at 
+		FROM posts p 
+		INNER JOIN users u ON p.user_id = u.id 
+		WHERE p.created_at <= ? AND u.del_flg = 0 
+		ORDER BY p.created_at DESC 
+		LIMIT ?`, t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -992,6 +1180,11 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	// Optimize database connection pool for high load
+	db.SetMaxOpenConns(100)          // Maximum number of open connections
+	db.SetMaxIdleConns(25)           // Maximum number of idle connections
+	db.SetConnMaxLifetime(time.Hour) // Maximum lifetime of connections
 
 	r := chi.NewRouter()
 
