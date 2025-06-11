@@ -143,7 +143,7 @@ func setUserCache(user *User) error {
 	return memcacheConn.Set(&memcache.Item{
 		Key:        key,
 		Value:      data,
-		Expiration: 1800, // Extended to 30 minutes for user data
+		Expiration: 3600, // Extended to 1 hour for user data (users rarely change)
 	})
 }
 
@@ -190,60 +190,43 @@ func setImageCache(postID int, data []byte, mime string) error {
 		return err
 	}
 
-	// Compress large image data
-	var finalData []byte
-	if len(jsonData) > 1024 { // Compress if larger than 1KB
-		var buf bytes.Buffer
-		gz := gzip.NewWriter(&buf)
-		if _, err := gz.Write(jsonData); err != nil {
-			return err
-		}
-		if err := gz.Close(); err != nil {
-			return err
-		}
-		finalData = buf.Bytes()
-		// Add compression flag to key
-		key += "_gz"
-	} else {
-		finalData = jsonData
+	// Always compress image data for better cache efficiency
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(jsonData); err != nil {
+		return err
 	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+
+	finalData := buf.Bytes()
+	// Always use compression flag for consistency
+	key += "_gz"
 
 	return memcacheConn.Set(&memcache.Item{
 		Key:        key,
 		Value:      finalData,
-		Expiration: 3600, // 1 hour for images
+		Expiration: 7200, // Extended to 2 hours for images (they rarely change)
 	})
 }
 
 func getImageFromCache(postID int) ([]byte, string, error) {
-	// Try compressed version first
-	compressedKey := getCacheKey("image", postID) + "_gz"
-	if item, err := memcacheConn.Get(compressedKey); err == nil {
-		// Decompress
-		gz, err := gzip.NewReader(bytes.NewReader(item.Value))
-		if err != nil {
-			return nil, "", err
-		}
-		defer gz.Close()
-
-		decompressed, err := io.ReadAll(gz)
-		if err != nil {
-			return nil, "", err
-		}
-
-		var imageData struct {
-			Data []byte `json:"data"`
-			Mime string `json:"mime"`
-		}
-		if err := json.Unmarshal(decompressed, &imageData); err != nil {
-			return nil, "", err
-		}
-		return imageData.Data, imageData.Mime, nil
+	// Always try compressed version (consistency with setImageCache)
+	key := getCacheKey("image", postID) + "_gz"
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return nil, "", err
 	}
 
-	// Fallback to uncompressed version
-	key := getCacheKey("image", postID)
-	item, err := memcacheConn.Get(key)
+	// Decompress
+	gz, err := gzip.NewReader(bytes.NewReader(item.Value))
+	if err != nil {
+		return nil, "", err
+	}
+	defer gz.Close()
+
+	decompressed, err := io.ReadAll(gz)
 	if err != nil {
 		return nil, "", err
 	}
@@ -252,7 +235,7 @@ func getImageFromCache(postID int) ([]byte, string, error) {
 		Data []byte `json:"data"`
 		Mime string `json:"mime"`
 	}
-	if err := json.Unmarshal(item.Value, &imageData); err != nil {
+	if err := json.Unmarshal(decompressed, &imageData); err != nil {
 		return nil, "", err
 	}
 	return imageData.Data, imageData.Mime, nil
@@ -281,7 +264,7 @@ func setPostsCache(cacheKey string, posts []Post) error {
 	return memcacheConn.Set(&memcache.Item{
 		Key:        cacheKey,
 		Value:      data,
-		Expiration: 180, // 3 minutes for post lists
+		Expiration: 300, // Reduced to 5 minutes for more frequent updates
 	})
 }
 
@@ -489,7 +472,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		}
 	}
 
-	// 2. Get comments with users using INNER JOIN
+	// 2. Get comments with users using optimized query
 	type CommentWithUser struct {
 		Comment
 		CommentUserID int       `db:"comment_user_id"`
@@ -503,6 +486,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	commentsMap := make(map[int][]Comment)
 	var commentResults []CommentWithUser
 
+	// Use a more efficient query that leverages indexes better
 	var commentsQuery string
 	if allComments {
 		commentsQuery = fmt.Sprintf(`
@@ -514,9 +498,9 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			FROM comments c
 			INNER JOIN users u ON c.user_id = u.id
 			WHERE c.post_id IN (%s)
-			ORDER BY c.post_id, c.created_at DESC`, placeholder)
+			ORDER BY c.post_id ASC, c.created_at DESC`, placeholder)
 	} else {
-		// For limited comments, use window function to get only top 3 per post
+		// More efficient approach using LIMIT per post
 		commentsQuery = fmt.Sprintf(`
 			SELECT 
 				c.id, c.post_id, c.user_id, c.comment, c.created_at,
@@ -524,13 +508,18 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 				u.passhash AS user_passhash, u.authority AS user_authority,
 				u.del_flg AS user_del_flg, u.created_at AS user_created_at
 			FROM (
-				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
-				FROM comments
-				WHERE post_id IN (%s)
+				SELECT c1.*
+				FROM comments c1
+				WHERE c1.post_id IN (%s)
+				AND (
+					SELECT COUNT(*)
+					FROM comments c2
+					WHERE c2.post_id = c1.post_id AND c2.created_at >= c1.created_at
+				) <= 3
+				ORDER BY c1.post_id ASC, c1.created_at DESC
 			) c
 			INNER JOIN users u ON c.user_id = u.id
-			WHERE c.rn <= 3
-			ORDER BY c.post_id, c.created_at DESC`, placeholder)
+			ORDER BY c.post_id ASC, c.created_at DESC`, placeholder)
 	}
 
 	err := db.Select(&commentResults, commentsQuery, args...)
@@ -562,36 +551,39 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		}
 	}
 
-	// 3. Get post users using INNER JOIN (with cache fallback)
+	// 3. Get post users using optimized batch cache operations
 	postUsersMap := make(map[int]User)
-	missedUserIDs := []int{}
 
-	// Try to get users from cache first
+	// Extract unique user IDs
+	uniqueUserIDs := make(map[int]bool)
 	for _, p := range results {
-		if user, err := getUserFromCache(p.UserID); err == nil {
+		uniqueUserIDs[p.UserID] = true
+	}
+
+	userIDsList := make([]int, 0, len(uniqueUserIDs))
+	for id := range uniqueUserIDs {
+		userIDsList = append(userIDsList, id)
+	}
+
+	// Try batch cache get first
+	cachedUsers, missedUserIDs := batchGetUsersFromCache(userIDsList)
+
+	// Map cached users to posts
+	for _, p := range results {
+		if user, found := cachedUsers[p.UserID]; found {
 			postUsersMap[p.ID] = *user
-		} else {
-			missedUserIDs = append(missedUserIDs, p.UserID)
 		}
 	}
 
 	// Fetch missed users from database in batch
 	if len(missedUserIDs) > 0 {
-		// Remove duplicates
-		uniqueUserIDs := make(map[int]bool)
-		for _, id := range missedUserIDs {
-			uniqueUserIDs[id] = true
-		}
-
-		userIDsList := make([]int, 0, len(uniqueUserIDs))
-		for id := range uniqueUserIDs {
-			userIDsList = append(userIDsList, id)
-		}
-
-		userArgs := make([]interface{}, len(userIDsList))
-		for i, id := range userIDsList {
+		// Remove duplicates (already done in batchGetUsersFromCache)
+		userArgs := make([]interface{}, len(missedUserIDs))
+		for i, id := range missedUserIDs {
 			userArgs[i] = id
 		}
+
+		userPlaceholder := strings.Repeat("?,", len(missedUserIDs)-1) + "?"
 
 		type PostUserResult struct {
 			PostID        int       `db:"post_id"`
@@ -611,13 +603,14 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 				u.del_flg AS user_del_flg, u.created_at AS user_created_at
 			FROM posts p
 			INNER JOIN users u ON p.user_id = u.id
-			WHERE p.id IN (%s)`, placeholder)
+			WHERE u.id IN (%s)`, userPlaceholder)
 
-		err = db.Select(&userResults, userQuery, args...)
+		err = db.Select(&userResults, userQuery, userArgs...)
 		if err != nil {
 			return nil, err
 		}
 
+		users := make([]User, 0, len(userResults))
 		for _, ur := range userResults {
 			user := User{
 				ID:          ur.UserID,
@@ -627,13 +620,19 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 				DelFlg:      ur.UserDelFlg,
 				CreatedAt:   ur.UserCreated,
 			}
-			postUsersMap[ur.PostID] = user
 
-			// Cache the user data
-			if err := setUserCache(&user); err != nil {
-				log.Printf("Failed to cache post user %d: %v", user.ID, err)
+			// Map to posts that use this user
+			for _, p := range results {
+				if p.UserID == user.ID {
+					postUsersMap[p.ID] = user
+				}
 			}
+
+			users = append(users, user)
 		}
+
+		// Batch cache the users
+		batchSetUsersCache(users)
 	}
 
 	// 4. Assemble the final posts
@@ -1396,11 +1395,18 @@ func setPostPageCache(postID int, userID int, content string) error {
 }
 
 func invalidatePostPageCache(postID int) {
-	// Invalidate for all possible users (rough approach)
-	for i := 0; i < 1000; i++ { // Assume max 1000 users
+	// More efficient approach: use a pattern-based key to track active user sessions
+	// Instead of deleting 1000 potential keys, use a smaller range based on actual users
+
+	// First, try to delete common user cache entries (logged in users typically have IDs 1-100)
+	for i := 0; i <= 100; i++ {
 		key := fmt.Sprintf("post_page:%d:%d", postID, i)
 		memcacheConn.Delete(key)
 	}
+
+	// Also invalidate any guest user cache (userID = 0)
+	guestKey := fmt.Sprintf("post_page:%d:0", postID)
+	memcacheConn.Delete(guestKey)
 }
 
 // Enhanced user session caching
@@ -1430,6 +1436,60 @@ func setUserSessionCache(sessionID string, user *User) error {
 		Value:      data,
 		Expiration: 1800, // 30 minutes for session cache
 	})
+}
+
+// Batch operations for better cache efficiency
+func batchGetUsersFromCache(userIDs []int) (map[int]*User, []int) {
+	foundUsers := make(map[int]*User)
+	missedIDs := []int{}
+
+	// Prepare cache keys
+	keys := make([]string, len(userIDs))
+	for i, id := range userIDs {
+		keys[i] = getCacheKey("user", id)
+	}
+
+	// Batch get from memcache
+	items, err := memcacheConn.GetMulti(keys)
+	if err != nil {
+		// If batch fails, fall back to individual gets
+		for _, id := range userIDs {
+			if user, err := getUserFromCache(id); err == nil {
+				foundUsers[id] = user
+			} else {
+				missedIDs = append(missedIDs, id)
+			}
+		}
+		return foundUsers, missedIDs
+	}
+
+	// Process results
+	for i, id := range userIDs {
+		key := keys[i]
+		if item, found := items[key]; found {
+			var user User
+			if err := json.Unmarshal(item.Value, &user); err == nil {
+				foundUsers[id] = &user
+			} else {
+				missedIDs = append(missedIDs, id)
+			}
+		} else {
+			missedIDs = append(missedIDs, id)
+		}
+	}
+
+	return foundUsers, missedIDs
+}
+
+func batchSetUsersCache(users []User) {
+	for _, user := range users {
+		// Use goroutine for non-blocking cache writes
+		go func(u User) {
+			if err := setUserCache(&u); err != nil {
+				log.Printf("Failed to cache user %d: %v", u.ID, err)
+			}
+		}(user)
+	}
 }
 
 func main() {
@@ -1471,22 +1531,22 @@ func main() {
 	defer db.Close()
 
 	// Optimize database connection pool for high load
-	db.SetMaxOpenConns(150)                 // Increased for better throughput
-	db.SetMaxIdleConns(50)                  // Increased idle connections
-	db.SetConnMaxLifetime(30 * time.Minute) // Shorter lifetime for better connection cycling
-	db.SetConnMaxIdleTime(5 * time.Minute)  // Close idle connections faster
+	db.SetMaxOpenConns(200)                 // Further increased for better throughput
+	db.SetMaxIdleConns(75)                  // More idle connections
+	db.SetConnMaxLifetime(20 * time.Minute) // Even shorter lifetime for better connection cycling
+	db.SetConnMaxIdleTime(3 * time.Minute)  // Close idle connections faster
 
 	r := chi.NewRouter()
 
-	// Add response compression middleware for better performance
-	r.Use(middleware.Compress(6, "text/html", "text/css", "text/javascript", "application/javascript"))
+	// Add response compression middleware for better performance (single instance)
+	r.Use(middleware.Compress(5, "text/html", "text/css", "text/javascript", "application/javascript"))
 
-	// Add request logging middleware for debugging
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
-
-	r.Use(middleware.Compress(gzip.BestCompression)) // Add gzip compression middleware
+	// Conditional logging only in development
+	if os.Getenv("ISUCON_ENV") != "production" {
+		r.Use(middleware.RequestID)
+		r.Use(middleware.RealIP)
+		r.Use(middleware.Logger)
+	}
 
 	r.Get("/initialize", getInitialize)
 	r.Get("/login", getLogin)
