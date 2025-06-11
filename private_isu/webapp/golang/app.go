@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	crand "crypto/rand"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -20,14 +23,16 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	db           *sqlx.DB
+	store        *gsm.MemcacheStore
+	memcacheConn *memcache.Client
 )
 
 const (
@@ -72,8 +77,20 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
-	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
+	memcacheConn = memcache.New(memdAddr)
+
+	// Configure memcache connection settings for better performance
+	memcacheConn.Timeout = 100 * time.Millisecond
+	memcacheConn.MaxIdleConns = 50
+
+	// Test memcache connection
+	if err := memcacheConn.Ping(); err != nil {
+		log.Printf("Warning: Failed to connect to memcache at %s: %v", memdAddr, err)
+	} else {
+		log.Printf("Successfully connected to memcache at %s", memdAddr)
+	}
+
+	store = gsm.NewMemcacheStore(memcacheConn, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
 
@@ -89,6 +106,213 @@ func dbInitialize() {
 	for _, sql := range sqls {
 		db.Exec(sql)
 	}
+
+	// Clear memcache on initialization
+	memcacheConn.FlushAll()
+}
+
+// Cache helper functions with improved TTL strategy
+func getCacheKey(prefix string, params ...interface{}) string {
+	key := prefix
+	for _, param := range params {
+		key += fmt.Sprintf("_%v", param)
+	}
+	return key
+}
+
+func getUserFromCache(userID int) (*User, error) {
+	key := getCacheKey("user", userID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return nil, err
+	}
+
+	var user User
+	if err := json.Unmarshal(item.Value, &user); err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func setUserCache(user *User) error {
+	key := getCacheKey("user", user.ID)
+	data, err := json.Marshal(user)
+	if err != nil {
+		return err
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      data,
+		Expiration: 1800, // Extended to 30 minutes for user data
+	})
+}
+
+func getCommentCountFromCache(postID int) (int, error) {
+	key := getCacheKey("comment_count", postID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return 0, err
+	}
+
+	var count int
+	if err := json.Unmarshal(item.Value, &count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func setCommentCountCache(postID, count int) error {
+	key := getCacheKey("comment_count", postID)
+	data, err := json.Marshal(count)
+	if err != nil {
+		return err
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      data,
+		Expiration: 600, // Extended to 10 minutes for comment counts
+	})
+}
+
+func setImageCache(postID int, data []byte, mime string) error {
+	key := getCacheKey("image", postID)
+	imageData := struct {
+		Data []byte `json:"data"`
+		Mime string `json:"mime"`
+	}{
+		Data: data,
+		Mime: mime,
+	}
+
+	jsonData, err := json.Marshal(imageData)
+	if err != nil {
+		return err
+	}
+
+	// Compress large image data
+	var finalData []byte
+	if len(jsonData) > 1024 { // Compress if larger than 1KB
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		if _, err := gz.Write(jsonData); err != nil {
+			return err
+		}
+		if err := gz.Close(); err != nil {
+			return err
+		}
+		finalData = buf.Bytes()
+		// Add compression flag to key
+		key += "_gz"
+	} else {
+		finalData = jsonData
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      finalData,
+		Expiration: 3600, // 1 hour for images
+	})
+}
+
+func getImageFromCache(postID int) ([]byte, string, error) {
+	// Try compressed version first
+	compressedKey := getCacheKey("image", postID) + "_gz"
+	if item, err := memcacheConn.Get(compressedKey); err == nil {
+		// Decompress
+		gz, err := gzip.NewReader(bytes.NewReader(item.Value))
+		if err != nil {
+			return nil, "", err
+		}
+		defer gz.Close()
+
+		decompressed, err := io.ReadAll(gz)
+		if err != nil {
+			return nil, "", err
+		}
+
+		var imageData struct {
+			Data []byte `json:"data"`
+			Mime string `json:"mime"`
+		}
+		if err := json.Unmarshal(decompressed, &imageData); err != nil {
+			return nil, "", err
+		}
+		return imageData.Data, imageData.Mime, nil
+	}
+
+	// Fallback to uncompressed version
+	key := getCacheKey("image", postID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var imageData struct {
+		Data []byte `json:"data"`
+		Mime string `json:"mime"`
+	}
+	if err := json.Unmarshal(item.Value, &imageData); err != nil {
+		return nil, "", err
+	}
+	return imageData.Data, imageData.Mime, nil
+}
+
+// New: Cache for post lists
+func getPostsFromCache(cacheKey string) ([]Post, error) {
+	item, err := memcacheConn.Get(cacheKey)
+	if err != nil {
+		return nil, err
+	}
+
+	var posts []Post
+	if err := json.Unmarshal(item.Value, &posts); err != nil {
+		return nil, err
+	}
+	return posts, nil
+}
+
+func setPostsCache(cacheKey string, posts []Post) error {
+	data, err := json.Marshal(posts)
+	if err != nil {
+		return err
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        cacheKey,
+		Value:      data,
+		Expiration: 180, // 3 minutes for post lists
+	})
+}
+
+// New: Cache for user statistics
+func getUserStatsFromCache(userID int) (map[string]int, error) {
+	key := getCacheKey("user_stats", userID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return nil, err
+	}
+
+	var stats map[string]int
+	if err := json.Unmarshal(item.Value, &stats); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+func setUserStatsCache(userID int, stats map[string]int) error {
+	key := getCacheKey("user_stats", userID)
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      data,
+		Expiration: 600, // 10 minutes for user statistics
+	})
 }
 
 func tryLogin(accountName, password string) *User {
@@ -149,13 +373,42 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
+	// Try to get user from session cache first
+	sessionID := session.ID
+	if sessionID != "" {
+		if user, err := getUserSessionFromCache(sessionID); err == nil {
+			return *user
+		}
+	}
 
+	// Try to get user from cache first
+	userID, ok := uid.(int64)
+	if !ok {
+		return User{}
+	}
+
+	if user, err := getUserFromCache(int(userID)); err == nil {
+		// Cache in session for faster future access
+		if sessionID != "" {
+			setUserSessionCache(sessionID, user)
+		}
+		return *user
+	}
+
+	// Cache miss, fetch from database
+	var u User
 	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
 	if err != nil {
 		return User{}
 	}
-
+	// Store in cache for next time
+	if err := setUserCache(&u); err != nil {
+		log.Printf("Failed to cache user %d: %v", u.ID, err)
+	}
+	// Also cache in session
+	if sessionID != "" {
+		setUserSessionCache(sessionID, &u)
+	}
 	return u
 }
 
@@ -173,48 +426,239 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
 
-	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+	// Extract post IDs for batch operations
+	postIDs := make([]int, len(results))
+	for i, p := range results {
+		postIDs[i] = p.ID
+	}
+
+	// Create IN clause placeholder
+	placeholder := strings.Repeat("?,", len(postIDs)-1) + "?"
+	args := make([]interface{}, len(postIDs))
+	for i, id := range postIDs {
+		args[i] = id
+	}
+
+	// 1. Get comment counts using LEFT JOIN (with cache fallback)
+	type CommentCountResult struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	commentCounts := make(map[int]int)
+
+	// Try to get counts from cache first
+	missedPostIDs := []int{}
+	for _, postID := range postIDs {
+		if count, err := getCommentCountFromCache(postID); err == nil {
+			commentCounts[postID] = count
+		} else {
+			missedPostIDs = append(missedPostIDs, postID)
+		}
+	}
+
+	// Fetch missed counts from database in batch
+	if len(missedPostIDs) > 0 {
+		missedPlaceholder := strings.Repeat("?,", len(missedPostIDs)-1) + "?"
+		missedArgs := make([]interface{}, len(missedPostIDs))
+		for i, id := range missedPostIDs {
+			missedArgs[i] = id
+		}
+
+		var countResults []CommentCountResult
+		countQuery := fmt.Sprintf(`
+			SELECT p.id AS post_id, COUNT(c.id) AS count
+			FROM posts p
+			LEFT JOIN comments c ON p.id = c.post_id
+			WHERE p.id IN (%s)
+			GROUP BY p.id`, missedPlaceholder)
+
+		err := db.Select(&countResults, countQuery, missedArgs...)
 		if err != nil {
 			return nil, err
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+		for _, cr := range countResults {
+			commentCounts[cr.PostID] = cr.Count
+			// Cache the result
+			if err := setCommentCountCache(cr.PostID, cr.Count); err != nil {
+				log.Printf("Failed to cache comment count for post %d: %v", cr.PostID, err)
 			}
 		}
+	}
 
-		// reverse
+	// 2. Get comments with users using INNER JOIN
+	type CommentWithUser struct {
+		Comment
+		CommentUserID int       `db:"comment_user_id"`
+		UserAccount   string    `db:"user_account_name"`
+		UserPassword  string    `db:"user_passhash"`
+		UserAuthority int       `db:"user_authority"`
+		UserDelFlg    int       `db:"user_del_flg"`
+		UserCreated   time.Time `db:"user_created_at"`
+	}
+
+	commentsMap := make(map[int][]Comment)
+	var commentResults []CommentWithUser
+
+	var commentsQuery string
+	if allComments {
+		commentsQuery = fmt.Sprintf(`
+			SELECT 
+				c.id, c.post_id, c.user_id, c.comment, c.created_at,
+				u.id AS comment_user_id, u.account_name AS user_account_name, 
+				u.passhash AS user_passhash, u.authority AS user_authority,
+				u.del_flg AS user_del_flg, u.created_at AS user_created_at
+			FROM comments c
+			INNER JOIN users u ON c.user_id = u.id
+			WHERE c.post_id IN (%s)
+			ORDER BY c.post_id, c.created_at DESC`, placeholder)
+	} else {
+		// For limited comments, use window function to get only top 3 per post
+		commentsQuery = fmt.Sprintf(`
+			SELECT 
+				c.id, c.post_id, c.user_id, c.comment, c.created_at,
+				u.id AS comment_user_id, u.account_name AS user_account_name, 
+				u.passhash AS user_passhash, u.authority AS user_authority,
+				u.del_flg AS user_del_flg, u.created_at AS user_created_at
+			FROM (
+				SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) as rn
+				FROM comments
+				WHERE post_id IN (%s)
+			) c
+			INNER JOIN users u ON c.user_id = u.id
+			WHERE c.rn <= 3
+			ORDER BY c.post_id, c.created_at DESC`, placeholder)
+	}
+
+	err := db.Select(&commentResults, commentsQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, cr := range commentResults {
+		comment := Comment{
+			ID:        cr.Comment.ID,
+			PostID:    cr.Comment.PostID,
+			UserID:    cr.Comment.UserID,
+			Comment:   cr.Comment.Comment,
+			CreatedAt: cr.Comment.CreatedAt,
+			User: User{
+				ID:          cr.CommentUserID,
+				AccountName: cr.UserAccount,
+				Passhash:    cr.UserPassword,
+				Authority:   cr.UserAuthority,
+				DelFlg:      cr.UserDelFlg,
+				CreatedAt:   cr.UserCreated,
+			},
+		}
+		commentsMap[cr.PostID] = append(commentsMap[cr.PostID], comment)
+
+		// Cache the user data
+		if err := setUserCache(&comment.User); err != nil {
+			log.Printf("Failed to cache comment user %d: %v", comment.User.ID, err)
+		}
+	}
+
+	// 3. Get post users using INNER JOIN (with cache fallback)
+	postUsersMap := make(map[int]User)
+	missedUserIDs := []int{}
+
+	// Try to get users from cache first
+	for _, p := range results {
+		if user, err := getUserFromCache(p.UserID); err == nil {
+			postUsersMap[p.ID] = *user
+		} else {
+			missedUserIDs = append(missedUserIDs, p.UserID)
+		}
+	}
+
+	// Fetch missed users from database in batch
+	if len(missedUserIDs) > 0 {
+		// Remove duplicates
+		uniqueUserIDs := make(map[int]bool)
+		for _, id := range missedUserIDs {
+			uniqueUserIDs[id] = true
+		}
+
+		userIDsList := make([]int, 0, len(uniqueUserIDs))
+		for id := range uniqueUserIDs {
+			userIDsList = append(userIDsList, id)
+		}
+
+		userArgs := make([]interface{}, len(userIDsList))
+		for i, id := range userIDsList {
+			userArgs[i] = id
+		}
+
+		type PostUserResult struct {
+			PostID        int       `db:"post_id"`
+			UserID        int       `db:"user_id"`
+			UserAccount   string    `db:"user_account_name"`
+			UserPassword  string    `db:"user_passhash"`
+			UserAuthority int       `db:"user_authority"`
+			UserDelFlg    int       `db:"user_del_flg"`
+			UserCreated   time.Time `db:"user_created_at"`
+		}
+
+		var userResults []PostUserResult
+		userQuery := fmt.Sprintf(`
+			SELECT 
+				p.id AS post_id, u.id AS user_id, u.account_name AS user_account_name,
+				u.passhash AS user_passhash, u.authority AS user_authority,
+				u.del_flg AS user_del_flg, u.created_at AS user_created_at
+			FROM posts p
+			INNER JOIN users u ON p.user_id = u.id
+			WHERE p.id IN (%s)`, placeholder)
+
+		err = db.Select(&userResults, userQuery, args...)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, ur := range userResults {
+			user := User{
+				ID:          ur.UserID,
+				AccountName: ur.UserAccount,
+				Passhash:    ur.UserPassword,
+				Authority:   ur.UserAuthority,
+				DelFlg:      ur.UserDelFlg,
+				CreatedAt:   ur.UserCreated,
+			}
+			postUsersMap[ur.PostID] = user
+
+			// Cache the user data
+			if err := setUserCache(&user); err != nil {
+				log.Printf("Failed to cache post user %d: %v", user.ID, err)
+			}
+		}
+	}
+
+	// 4. Assemble the final posts
+	var posts []Post
+	for _, p := range results {
+		// Set comment count
+		p.CommentCount = commentCounts[p.ID]
+
+		// Set comments (reverse order for display)
+		comments := commentsMap[p.ID]
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
+		// Set user
+		if user, exists := postUsersMap[p.ID]; exists {
+			p.User = user
 		}
 
 		p.CSRFToken = csrfToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		// Add post to results (deleted user check already done in query)
+		posts = append(posts, p)
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -383,20 +827,63 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
+	session := getSession(r)
 	me := getSessionUser(r)
 
-	results := []Post{}
-
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
+	// Try to get posts from cache first
+	cacheKey := "index_posts"
+	posts, err := getPostsFromCache(cacheKey)
 	if err != nil {
-		log.Print(err)
-		return
+		// Cache miss, fetch from database
+		results := []Post{}
+
+		// Only fetch posts from non-deleted users and limit to what we actually need
+		// This pre-filters deleted users and limits the dataset early
+		err := db.Select(&results, `
+			SELECT p.id, p.user_id, p.body, p.mime, p.created_at 
+			FROM posts p 
+			INNER JOIN users u ON p.user_id = u.id 
+			WHERE u.del_flg = 0 
+			ORDER BY p.created_at DESC 
+			LIMIT ?`, postsPerPage)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// Get CSRF token from the already retrieved session
+		var csrfToken string
+		if token, ok := session.Values["csrf_token"]; ok {
+			csrfToken = token.(string)
+		}
+
+		posts, err = makePosts(results, csrfToken, false)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		// Cache the results
+		setPostsCache(cacheKey, posts)
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
-	if err != nil {
-		log.Print(err)
-		return
+	// Get CSRF token from the already retrieved session
+	var csrfToken string
+	if token, ok := session.Values["csrf_token"]; ok {
+		csrfToken = token.(string)
+	}
+
+	// Update CSRF tokens for cached posts
+	for i := range posts {
+		posts[i].CSRFToken = csrfToken
+	}
+
+	// Get flash message from the already retrieved session
+	var flash string
+	if value, ok := session.Values["notice"]; ok && value != nil {
+		flash = value.(string)
+		delete(session.Values, "notice")
+		session.Save(r, w)
 	}
 
 	fmap := template.FuncMap{
@@ -413,7 +900,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		Me        User
 		CSRFToken string
 		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	}{posts, me, csrfToken, flash})
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -445,40 +932,59 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	postCount := len(postIDs)
-
-	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
+	// Try to get user statistics from cache first
+	var commentCount, postCount, commentedCount int
+	if stats, err := getUserStatsFromCache(user.ID); err == nil {
+		commentCount = stats["comment_count"]
+		postCount = stats["post_count"]
+		commentedCount = stats["commented_count"]
+	} else {
+		// Cache miss, calculate from database
+		type UserStats struct {
+			CommentCount   int `db:"comment_count"`
+			PostCount      int `db:"post_count"`
+			CommentedCount int `db:"commented_count"`
 		}
 
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
+		var stats UserStats
+		err = db.Get(&stats, `
+			SELECT 
+				COALESCE(comment_stats.comment_count, 0) AS comment_count,
+				COALESCE(post_stats.post_count, 0) AS post_count,
+				COALESCE(commented_stats.commented_count, 0) AS commented_count
+			FROM (SELECT 1) dummy
+			LEFT JOIN (
+				SELECT COUNT(*) AS comment_count 
+				FROM comments 
+				WHERE user_id = ?
+			) comment_stats ON 1=1
+			LEFT JOIN (
+				SELECT COUNT(*) AS post_count 
+				FROM posts 
+				WHERE user_id = ?
+			) post_stats ON 1=1
+			LEFT JOIN (
+				SELECT COUNT(*) AS commented_count 
+				FROM comments c 
+				INNER JOIN posts p ON c.post_id = p.id 
+				WHERE p.user_id = ?
+			) commented_stats ON 1=1`, user.ID, user.ID, user.ID)
 		if err != nil {
 			log.Print(err)
 			return
 		}
+
+		commentCount = stats.CommentCount
+		postCount = stats.PostCount
+		commentedCount = stats.CommentedCount
+
+		// Cache the results
+		statsMap := map[string]int{
+			"comment_count":   commentCount,
+			"post_count":      postCount,
+			"commented_count": commentedCount,
+		}
+		setUserStatsCache(user.ID, statsMap)
 	}
 
 	me := getSessionUser(r)
@@ -521,7 +1027,13 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
+	err = db.Select(&results, `
+		SELECT p.id, p.user_id, p.body, p.mime, p.created_at 
+		FROM posts p 
+		INNER JOIN users u ON p.user_id = u.id 
+		WHERE p.created_at <= ? AND u.del_flg = 0 
+		ORDER BY p.created_at DESC 
+		LIMIT ?`, t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -556,8 +1068,22 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	me := getSessionUser(r)
+	userID := 0
+	if me.ID != 0 {
+		userID = me.ID
+	}
+
+	// Try to get cached page first
+	if cachedHTML, err := getPostPageFromCache(pid, userID); err == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(cachedHTML))
+		return
+	}
+
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	// Only fetch necessary fields, not the large imgdata field
+	err = db.Select(&results, "SELECT id, user_id, body, mime, created_at FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -576,20 +1102,35 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	p := posts[0]
 
-	me := getSessionUser(r)
-
 	fmap := template.FuncMap{
 		"imageURL": imageURL,
 	}
 
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+	// Render to buffer first for caching
+	var buf bytes.Buffer
+	err = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("post_id.html"),
 		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	)).Execute(&buf, struct {
 		Post Post
 		Me   User
 	}{p, me})
+
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	// Cache the rendered page
+	htmlContent := buf.String()
+	if err := setPostPageCache(pid, userID, htmlContent); err != nil {
+		log.Printf("Failed to cache post page %d for user %d: %v", pid, userID, err)
+	}
+
+	// Send response
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(buf.Bytes())
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
@@ -668,6 +1209,14 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cache the newly uploaded image
+	if err := setImageCache(int(pid), filedata, mime); err != nil {
+		log.Printf("Failed to cache uploaded image %d: %v", pid, err)
+	}
+
+	// Invalidate index posts cache since we added a new post
+	memcacheConn.Delete("index_posts")
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -711,21 +1260,39 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	// Try to get image from cache first
+	imgdata, mime, err := getImageFromCache(pid)
 	if err != nil {
-		log.Print(err)
-		return
+		// Cache miss, fetch from database
+		post := Post{}
+		err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+
+		if post.ID == 0 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		imgdata = post.Imgdata
+		mime = post.Mime
+		// Store in cache for next time
+		if err := setImageCache(pid, imgdata, mime); err != nil {
+			log.Printf("Failed to cache image %d: %v", pid, err)
+		}
 	}
 	_ = writeImageToFile(post) // 画像取得時にファイル書き出し
 
 	ext := r.PathValue("ext")
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+	if ext == "jpg" && mime == "image/jpeg" ||
+		ext == "png" && mime == "image/png" ||
+		ext == "gif" && mime == "image/gif" {
+		w.Header().Set("Content-Type", mime)
+		w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 1 day
+		_, err := w.Write(imgdata)
 		if err != nil {
 			log.Print(err)
 			return
@@ -760,6 +1327,24 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
+
+	// Invalidate comment count cache when new comment is added
+	key := getCacheKey("comment_count", postID)
+	memcacheConn.Delete(key)
+
+	// Invalidate user statistics cache for the commenter
+	userStatsKey := getCacheKey("user_stats", me.ID)
+	memcacheConn.Delete(userStatsKey)
+
+	// Also invalidate the post owner's user statistics cache
+	var postUserID int
+	if err := db.Get(&postUserID, "SELECT user_id FROM posts WHERE id = ?", postID); err == nil {
+		postOwnerStatsKey := getCacheKey("user_stats", postUserID)
+		memcacheConn.Delete(postOwnerStatsKey)
+	}
+
+	// Invalidate post page cache for this specific post
+	invalidatePostPageCache(postID)
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
@@ -825,6 +1410,62 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
 
+// Page-level caching for post detail pages
+func getPostPageFromCache(postID int, userID int) (string, error) {
+	key := fmt.Sprintf("post_page:%d:%d", postID, userID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return "", err
+	}
+	return string(item.Value), nil
+}
+
+func setPostPageCache(postID int, userID int, content string) error {
+	key := fmt.Sprintf("post_page:%d:%d", postID, userID)
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      []byte(content),
+		Expiration: 300, // 5 minutes for page cache
+	})
+}
+
+func invalidatePostPageCache(postID int) {
+	// Invalidate for all possible users (rough approach)
+	for i := 0; i < 1000; i++ { // Assume max 1000 users
+		key := fmt.Sprintf("post_page:%d:%d", postID, i)
+		memcacheConn.Delete(key)
+	}
+}
+
+// Enhanced user session caching
+func getUserSessionFromCache(sessionID string) (*User, error) {
+	key := getCacheKey("session", sessionID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return nil, err
+	}
+
+	var user User
+	if err := json.Unmarshal(item.Value, &user); err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func setUserSessionCache(sessionID string, user *User) error {
+	key := getCacheKey("session", sessionID)
+	data, err := json.Marshal(user)
+	if err != nil {
+		return err
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      data,
+		Expiration: 1800, // 30 minutes for session cache
+	})
+}
+
 func main() {
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
@@ -863,7 +1504,23 @@ func main() {
 	}
 	defer db.Close()
 
+	// Optimize database connection pool for high load
+	db.SetMaxOpenConns(150)                 // Increased for better throughput
+	db.SetMaxIdleConns(50)                  // Increased idle connections
+	db.SetConnMaxLifetime(30 * time.Minute) // Shorter lifetime for better connection cycling
+	db.SetConnMaxIdleTime(5 * time.Minute)  // Close idle connections faster
+
 	r := chi.NewRouter()
+
+	// Add response compression middleware for better performance
+	r.Use(middleware.Compress(6, "text/html", "text/css", "text/javascript", "application/javascript"))
+
+	// Add request logging middleware for debugging
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Logger)
+
+	r.Use(middleware.Compress(gzip.BestCompression)) // Add gzip compression middleware
 
 	r.Get("/initialize", getInitialize)
 	r.Get("/login", getLogin)
@@ -880,9 +1537,17 @@ func main() {
 	r.Get("/admin/banned", getAdminBanned)
 	r.Post("/admin/banned", postAdminBanned)
 	r.Get(`/@{accountName:[a-zA-Z]+}`, getAccountName)
-	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+
+	// Static file serving with proper cache headers
+	r.Handle("/*", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set cache headers for static files
+		if strings.HasSuffix(r.URL.Path, ".css") || strings.HasSuffix(r.URL.Path, ".js") ||
+			strings.HasSuffix(r.URL.Path, ".png") || strings.HasSuffix(r.URL.Path, ".jpg") ||
+			strings.HasSuffix(r.URL.Path, ".gif") || strings.HasSuffix(r.URL.Path, ".ico") {
+			w.Header().Set("Cache-Control", "public, max-age=86400") // 1 day
+		}
 		http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
-	})
+	}))
 
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
