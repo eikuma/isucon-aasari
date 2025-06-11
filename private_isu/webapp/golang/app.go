@@ -2,6 +2,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -25,8 +26,9 @@ import (
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	db           *sqlx.DB
+	store        *gsm.MemcacheStore
+	memcacheConn *memcache.Client
 )
 
 const (
@@ -71,8 +73,8 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
-	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
+	memcacheConn = memcache.New(memdAddr)
+	store = gsm.NewMemcacheStore(memcacheConn, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
 
@@ -88,6 +90,113 @@ func dbInitialize() {
 	for _, sql := range sqls {
 		db.Exec(sql)
 	}
+
+	// Clear memcache on initialization
+	memcacheConn.FlushAll()
+}
+
+// Cache helper functions
+func getCacheKey(prefix string, params ...interface{}) string {
+	key := prefix
+	for _, param := range params {
+		key += fmt.Sprintf("_%v", param)
+	}
+	return key
+}
+
+func getUserFromCache(userID int) (*User, error) {
+	key := getCacheKey("user", userID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return nil, err
+	}
+
+	var user User
+	if err := json.Unmarshal(item.Value, &user); err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func setUserCache(user *User) error {
+	key := getCacheKey("user", user.ID)
+	data, err := json.Marshal(user)
+	if err != nil {
+		return err
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      data,
+		Expiration: 300, // 5 minutes
+	})
+}
+
+func getCommentCountFromCache(postID int) (int, error) {
+	key := getCacheKey("comment_count", postID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return 0, err
+	}
+
+	var count int
+	if err := json.Unmarshal(item.Value, &count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func setCommentCountCache(postID, count int) error {
+	key := getCacheKey("comment_count", postID)
+	data, err := json.Marshal(count)
+	if err != nil {
+		return err
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      data,
+		Expiration: 300, // 5 minutes
+	})
+}
+
+func getImageFromCache(postID int) ([]byte, string, error) {
+	key := getCacheKey("image", postID)
+	item, err := memcacheConn.Get(key)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var imageData struct {
+		Data []byte `json:"data"`
+		Mime string `json:"mime"`
+	}
+	if err := json.Unmarshal(item.Value, &imageData); err != nil {
+		return nil, "", err
+	}
+	return imageData.Data, imageData.Mime, nil
+}
+
+func setImageCache(postID int, data []byte, mime string) error {
+	key := getCacheKey("image", postID)
+	imageData := struct {
+		Data []byte `json:"data"`
+		Mime string `json:"mime"`
+	}{
+		Data: data,
+		Mime: mime,
+	}
+
+	jsonData, err := json.Marshal(imageData)
+	if err != nil {
+		return err
+	}
+
+	return memcacheConn.Set(&memcache.Item{
+		Key:        key,
+		Value:      jsonData,
+		Expiration: 3600, // 1 hour for images
+	})
 }
 
 func tryLogin(accountName, password string) *User {
@@ -148,14 +257,26 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
-
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-	if err != nil {
+	// Try to get user from cache first
+	userID, ok := uid.(int64)
+	if !ok {
 		return User{}
 	}
 
-	return u
+	user, err := getUserFromCache(int(userID))
+	if err != nil {
+		// Cache miss, fetch from database
+		var u User
+		err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+		if err != nil {
+			return User{}
+		}
+		// Store in cache for next time
+		setUserCache(&u)
+		return u
+	}
+
+	return *user
 }
 
 func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
@@ -175,10 +296,18 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	var posts []Post
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		// Try to get comment count from cache first
+		commentCount, err := getCommentCountFromCache(p.ID)
 		if err != nil {
-			return nil, err
+			// Cache miss, fetch from database
+			err = db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+			if err != nil {
+				return nil, err
+			}
+			// Store in cache for next time
+			setCommentCountCache(p.ID, commentCount)
 		}
+		p.CommentCount = commentCount
 
 		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
 		if !allComments {
@@ -191,9 +320,18 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		}
 
 		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			// Try to get user from cache first
+			user, err := getUserFromCache(comments[i].UserID)
 			if err != nil {
-				return nil, err
+				// Cache miss, fetch from database
+				err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+				if err != nil {
+					return nil, err
+				}
+				// Store in cache for next time
+				setUserCache(&comments[i].User)
+			} else {
+				comments[i].User = *user
 			}
 		}
 
@@ -204,9 +342,18 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		// Try to get post user from cache first
+		user, err := getUserFromCache(p.UserID)
 		if err != nil {
-			return nil, err
+			// Cache miss, fetch from database
+			err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+			if err != nil {
+				return nil, err
+			}
+			// Store in cache for next time
+			setUserCache(&p.User)
+		} else {
+			p.User = *user
 		}
 
 		p.CSRFToken = csrfToken
@@ -667,6 +814,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cache the newly uploaded image
+	setImageCache(int(pid), filedata, mime)
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -678,20 +828,30 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	// Try to get image from cache first
+	imgdata, mime, err := getImageFromCache(pid)
 	if err != nil {
-		log.Print(err)
-		return
+		// Cache miss, fetch from database
+		post := Post{}
+		err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		imgdata = post.Imgdata
+		mime = post.Mime
+		// Store in cache for next time
+		setImageCache(pid, imgdata, mime)
 	}
 
 	ext := r.PathValue("ext")
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+	if ext == "jpg" && mime == "image/jpeg" ||
+		ext == "png" && mime == "image/png" ||
+		ext == "gif" && mime == "image/gif" {
+		w.Header().Set("Content-Type", mime)
+		w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 1 day
+		_, err := w.Write(imgdata)
 		if err != nil {
 			log.Print(err)
 			return
@@ -726,6 +886,10 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
+
+	// Invalidate comment count cache when new comment is added
+	key := getCacheKey("comment_count", postID)
+	memcacheConn.Delete(key)
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
