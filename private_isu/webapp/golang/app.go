@@ -74,6 +74,14 @@ func init() {
 		memdAddr = "localhost:11211"
 	}
 	memcacheConn = memcache.New(memdAddr)
+
+	// Test memcache connection
+	if err := memcacheConn.Ping(); err != nil {
+		log.Printf("Warning: Failed to connect to memcache at %s: %v", memdAddr, err)
+	} else {
+		log.Printf("Successfully connected to memcache at %s", memdAddr)
+	}
+
 	store = gsm.NewMemcacheStore(memcacheConn, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -106,15 +114,19 @@ func getCacheKey(prefix string, params ...interface{}) string {
 
 func getUserFromCache(userID int) (*User, error) {
 	key := getCacheKey("user", userID)
+	log.Printf("Attempting to get user from cache with key: %s", key)
 	item, err := memcacheConn.Get(key)
 	if err != nil {
+		log.Printf("Cache miss for user %d: %v", userID, err)
 		return nil, err
 	}
 
 	var user User
 	if err := json.Unmarshal(item.Value, &user); err != nil {
+		log.Printf("Failed to unmarshal cached user %d: %v", userID, err)
 		return nil, err
 	}
+	log.Printf("Cache hit for user %d", userID)
 	return &user, nil
 }
 
@@ -122,14 +134,22 @@ func setUserCache(user *User) error {
 	key := getCacheKey("user", user.ID)
 	data, err := json.Marshal(user)
 	if err != nil {
+		log.Printf("Failed to marshal user %d: %v", user.ID, err)
 		return err
 	}
 
-	return memcacheConn.Set(&memcache.Item{
+	log.Printf("Setting user cache with key: %s", key)
+	err = memcacheConn.Set(&memcache.Item{
 		Key:        key,
 		Value:      data,
 		Expiration: 300, // 5 minutes
 	})
+	if err != nil {
+		log.Printf("Failed to set user cache for %d: %v", user.ID, err)
+	} else {
+		log.Printf("Successfully cached user %d", user.ID)
+	}
+	return err
 }
 
 func getCommentCountFromCache(postID int) (int, error) {
@@ -263,20 +283,21 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	user, err := getUserFromCache(int(userID))
-	if err != nil {
-		// Cache miss, fetch from database
-		var u User
-		err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-		if err != nil {
-			return User{}
-		}
-		// Store in cache for next time
-		setUserCache(&u)
-		return u
+	if user, err := getUserFromCache(int(userID)); err == nil {
+		return *user
 	}
 
-	return *user
+	// Cache miss, fetch from database
+	var u User
+	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	if err != nil {
+		return User{}
+	}
+	// Store in cache for next time
+	if err := setUserCache(&u); err != nil {
+		log.Printf("Failed to cache user %d: %v", u.ID, err)
+	}
+	return u
 }
 
 func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
@@ -351,7 +372,9 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		for _, cr := range countResults {
 			commentCounts[cr.PostID] = cr.Count
 			// Cache the result
-			setCommentCountCache(cr.PostID, cr.Count)
+			if err := setCommentCountCache(cr.PostID, cr.Count); err != nil {
+				log.Printf("Failed to cache comment count for post %d: %v", cr.PostID, err)
+			}
 		}
 	}
 
@@ -423,7 +446,9 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		commentsMap[cr.PostID] = append(commentsMap[cr.PostID], comment)
 
 		// Cache the user data
-		setUserCache(&comment.User)
+		if err := setUserCache(&comment.User); err != nil {
+			log.Printf("Failed to cache comment user %d: %v", comment.User.ID, err)
+		}
 	}
 
 	// 3. Get post users using INNER JOIN (with cache fallback)
@@ -494,7 +519,9 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			postUsersMap[ur.PostID] = user
 
 			// Cache the user data
-			setUserCache(&user)
+			if err := setUserCache(&user); err != nil {
+				log.Printf("Failed to cache post user %d: %v", user.ID, err)
+			}
 		}
 	}
 
@@ -1003,7 +1030,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache the newly uploaded image
-	setImageCache(int(pid), filedata, mime)
+	if err := setImageCache(int(pid), filedata, mime); err != nil {
+		log.Printf("Failed to cache uploaded image %d: %v", pid, err)
+	}
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
@@ -1026,10 +1055,18 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 			log.Print(err)
 			return
 		}
+
+		if post.ID == 0 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
 		imgdata = post.Imgdata
 		mime = post.Mime
 		// Store in cache for next time
-		setImageCache(pid, imgdata, mime)
+		if err := setImageCache(pid, imgdata, mime); err != nil {
+			log.Printf("Failed to cache image %d: %v", pid, err)
+		}
 	}
 
 	ext := r.PathValue("ext")
