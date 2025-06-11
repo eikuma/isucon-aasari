@@ -9,7 +9,7 @@ normalize: true
 group_by: request_uri
 
 # 上位N件のみ表示
-limit: 50
+limit: 100000
 
 # ソート対象（count, sum, avg など）
 sort: sum
