@@ -19,6 +19,3 @@ sort: sum
 
 # ログフォーマット（明示しないと LTSV assumed）
 # format: ltsv
-regexp:
-  - uri_regexp: ^/image/\d+\.jpg$
-    uri_replace: /image/:id.jpg
