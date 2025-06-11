@@ -20,3 +20,8 @@ sort: sum
 # ログフォーマット（明示しないと LTSV assumed）
 # format: ltsv
 log_format: combined
+
+regexp:
+  pattern: '^(?P<remote_addr>[^ ]*) - (?P<remote_user>[^ ]*) \[(?P<time_local>[^\]]*)\] "(?P<request>[^"]*)" (?P<status>\d+) (?P<body_bytes_sent>\d+) "(?P<http_referer>[^"]*)" "(?P<http_user_agent>[^"]*)"'
+  time_format: '%d/%b/%Y:%H:%M:%S %z'
+  time_key: time_local

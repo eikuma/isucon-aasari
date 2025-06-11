@@ -47,7 +47,7 @@ slow-query:
 # alpでアクセスログを確認する
 .PHONY: alp
 alp:
-	sudo alp --file=$(NGINX_LOG) --config=/home/isucon/private_isu/tool-config/alp/config.yml
+	sudo alp regexp --file=$(NGINX_LOG) --config=/home/isucon/private_isu/tool-config/alp/config.yml
 
 # pprofで記録する
 .PHONY: pprof-record
