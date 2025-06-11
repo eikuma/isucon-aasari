@@ -172,43 +172,145 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
+
 	var posts []Post
 
+	// 投稿IDとユーザーIDを収集
+	postIDs := make([]int, 0, len(results))
+	userIDs := make([]int, 0, len(results))
+	userIDSet := make(map[int]bool)
+
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		postIDs = append(postIDs, p.ID)
+		if !userIDSet[p.UserID] {
+			userIDs = append(userIDs, p.UserID)
+			userIDSet[p.UserID] = true
+		}
+	}
+
+	// 1. 全投稿のユーザー情報を一括取得
+	userMap := make(map[int]User)
+	if len(userIDs) > 0 {
+		userPlaceholders := strings.Repeat("?,", len(userIDs)-1) + "?"
+		userArgs := make([]interface{}, len(userIDs))
+		for i, id := range userIDs {
+			userArgs[i] = id
+		}
+
+		var users []User
+		err := db.Select(&users, "SELECT * FROM `users` WHERE `id` IN ("+userPlaceholders+")", userArgs...)
 		if err != nil {
 			return nil, err
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
+		for _, user := range users {
+			userMap[user.ID] = user
 		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+	}
+
+	// 2. 全投稿のコメント数を一括取得
+	commentCountMap := make(map[int]int)
+	if len(postIDs) > 0 {
+		postPlaceholders := strings.Repeat("?,", len(postIDs)-1) + "?"
+		postArgs := make([]interface{}, len(postIDs))
+		for i, id := range postIDs {
+			postArgs[i] = id
+		}
+
+		var commentCounts []struct {
+			PostID int `db:"post_id"`
+			Count  int `db:"count"`
+		}
+		err := db.Select(&commentCounts, "SELECT `post_id`, COUNT(*) as `count` FROM `comments` WHERE `post_id` IN ("+postPlaceholders+") GROUP BY `post_id`", postArgs...)
 		if err != nil {
 			return nil, err
 		}
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+		for _, cc := range commentCounts {
+			commentCountMap[cc.PostID] = cc.Count
+		}
+	}
+
+	// 3. 全投稿のコメントを一括取得
+	commentsMap := make(map[int][]Comment)
+	if len(postIDs) > 0 {
+		query := "SELECT * FROM `comments` WHERE `post_id` IN (" + postPlaceholders + ") ORDER BY `post_id`, `created_at` DESC"
+		var allComments []Comment
+		err := db.Select(&allComments, query, postArgs...)
+		if err != nil {
+			return nil, err
+		}
+
+		// コメントのユーザーIDを収集
+		commentUserIDs := make([]int, 0)
+		commentUserIDSet := make(map[int]bool)
+		for _, comment := range allComments {
+			if !commentUserIDSet[comment.UserID] {
+				commentUserIDs = append(commentUserIDs, comment.UserID)
+				commentUserIDSet[comment.UserID] = true
 			}
 		}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+		// コメントユーザー情報を一括取得
+		commentUserMap := make(map[int]User)
+		if len(commentUserIDs) > 0 {
+			commentUserPlaceholders := strings.Repeat("?,", len(commentUserIDs)-1) + "?"
+			commentUserArgs := make([]interface{}, len(commentUserIDs))
+			for i, id := range commentUserIDs {
+				commentUserArgs[i] = id
+			}
+
+			var commentUsers []User
+			err := db.Select(&commentUsers, "SELECT * FROM `users` WHERE `id` IN ("+commentUserPlaceholders+")", commentUserArgs...)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, user := range commentUsers {
+				commentUserMap[user.ID] = user
+			}
 		}
 
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
+		// コメントをpost_idごとにグループ化
+		for _, comment := range allComments {
+			comment.User = commentUserMap[comment.UserID]
+			commentsMap[comment.PostID] = append(commentsMap[comment.PostID], comment)
 		}
 
+		// allCommentsがfalseの場合は3件制限
+		if !allComments {
+			for postID, comments := range commentsMap {
+				if len(comments) > 3 {
+					commentsMap[postID] = comments[:3]
+				}
+			}
+		}
+
+		// コメントの順序を逆転（新しい順→古い順）
+		for postID, comments := range commentsMap {
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
+			commentsMap[postID] = comments
+		}
+	}
+
+	// 4. 結果を組み立て
+	for _, p := range results {
+		user, exists := userMap[p.UserID]
+		if !exists {
+			continue // ユーザーが見つからない場合はスキップ
+		}
+
+		p.User = user
+		p.CommentCount = commentCountMap[p.ID]
+		p.Comments = commentsMap[p.ID]
+		if p.Comments == nil {
+			p.Comments = []Comment{}
+		}
 		p.CSRFToken = csrfToken
 
 		if p.User.DelFlg == 0 {
