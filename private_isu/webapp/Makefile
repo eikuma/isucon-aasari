@@ -1,4 +1,4 @@
-include env.sh
+include /home/isucon/env.sh
 # 変数定義 ------------------------
 
 # SERVER_ID: env.sh内で定義
