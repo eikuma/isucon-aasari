@@ -9,7 +9,7 @@ normalize: true
 group_by: request_uri
 
 # 上位N件のみ表示
-limit: 50
+limit: 100000
 
 # ソート対象（count, sum, avg など）
 sort: sum
@@ -19,4 +19,6 @@ sort: sum
 
 # ログフォーマット（明示しないと LTSV assumed）
 # format: ltsv
-log_format: combined
+regexp:
+  - uri_regexp: ^/image/\d+\.jpg$
+    uri_replace: /image/:id.jpg
