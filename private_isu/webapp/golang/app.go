@@ -2,6 +2,7 @@ package main
 
 import (
 	crand "crypto/rand"
+	"database/sql"
 	"fmt"
 	"html/template"
 	"io"
@@ -64,6 +65,67 @@ type Comment struct {
 	Comment   string    `db:"comment"`
 	CreatedAt time.Time `db:"created_at"`
 	User      User
+}
+
+// Post, User, Comment, CommentUser, CommentCountを一発で取得するSQL
+const postsWithCommentsQuery = `
+SELECT
+  p.id AS post_id,
+  p.body AS post_body,
+  p.created_at AS post_created_at,
+  p.mime AS post_mime,
+  p.imgdata AS post_imgdata,
+  u.id AS user_id,
+  u.account_name AS user_account_name,
+  u.del_flg AS user_del_flg,
+  u.authority AS user_authority,
+  u.created_at AS user_created_at,
+  c.id AS comment_id,
+  c.comment AS comment_body,
+  c.created_at AS comment_created_at,
+  cu.id AS comment_user_id,
+  cu.account_name AS comment_user_account_name,
+  cu.del_flg AS comment_user_del_flg,
+  cu.authority AS comment_user_authority,
+  cu.created_at AS comment_user_created_at,
+  pc.comment_count
+FROM (
+  SELECT * FROM posts ORDER BY created_at DESC LIMIT ?
+) p
+JOIN users u ON p.user_id = u.id
+LEFT JOIN (
+  SELECT
+    c.*,
+    ROW_NUMBER() OVER (PARTITION BY c.post_id ORDER BY c.created_at DESC) AS rn
+  FROM comments c
+) c ON c.post_id = p.id AND c.rn <= 3
+LEFT JOIN users cu ON c.user_id = cu.id
+LEFT JOIN (
+  SELECT post_id, COUNT(*) AS comment_count FROM comments GROUP BY post_id
+) pc ON pc.post_id = p.id
+ORDER BY p.created_at DESC, c.created_at ASC
+`
+
+type postWithCommentRow struct {
+	PostID                 int            `db:"post_id"`
+	PostBody               string         `db:"post_body"`
+	PostCreatedAt          time.Time      `db:"post_created_at"`
+	PostMime               string         `db:"post_mime"`
+	PostImgdata            []byte         `db:"post_imgdata"`
+	UserID                 int            `db:"user_id"`
+	UserAccountName        string         `db:"user_account_name"`
+	UserDelFlg             int            `db:"user_del_flg"`
+	UserAuthority          int            `db:"user_authority"`
+	UserCreatedAt          time.Time      `db:"user_created_at"`
+	CommentID              sql.NullInt64  `db:"comment_id"`
+	CommentBody            sql.NullString `db:"comment_body"`
+	CommentCreatedAt       sql.NullTime   `db:"comment_created_at"`
+	CommentUserID          sql.NullInt64  `db:"comment_user_id"`
+	CommentUserAccountName sql.NullString `db:"comment_user_account_name"`
+	CommentUserDelFlg      sql.NullInt64  `db:"comment_user_del_flg"`
+	CommentUserAuthority   sql.NullInt64  `db:"comment_user_authority"`
+	CommentUserCreatedAt   sql.NullTime   `db:"comment_user_created_at"`
+	CommentCount           sql.NullInt64  `db:"comment_count"`
 }
 
 func init() {
@@ -171,110 +233,60 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	if len(results) == 0 {
-		return []Post{}, nil
-	}
-
-	// 投稿IDリスト作成
-	postIDs := make([]int, 0, len(results))
-	userIDs := make(map[int]struct{})
-	for _, p := range results {
-		postIDs = append(postIDs, p.ID)
-		userIDs[p.UserID] = struct{}{}
-	}
-
-	// コメント一括取得
-	comments := []Comment{}
-	commentQuery := "SELECT * FROM `comments` WHERE `post_id` IN ("
-	placeholders := make([]string, len(postIDs))
-	args := make([]interface{}, len(postIDs))
-	for i, id := range postIDs {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	commentQuery += strings.Join(placeholders, ", ") + ") ORDER BY `created_at` DESC"
-	if !allComments {
-		// 直近3件だけ取得する場合は、Go側で制御する
-	}
-	if err := db.Select(&comments, commentQuery, args...); err != nil {
-		return nil, err
-	}
-
-	// コメントユーザーIDリスト作成
-	commentUserIDs := make(map[int]struct{})
-	for _, c := range comments {
-		commentUserIDs[c.UserID] = struct{}{}
-	}
-	// 投稿ユーザーIDも含める
-	for uid := range userIDs {
-		commentUserIDs[uid] = struct{}{}
-	}
-
-	// ユーザー一括取得
-	allUserIDs := make([]int, 0, len(commentUserIDs))
-	for uid := range commentUserIDs {
-		allUserIDs = append(allUserIDs, uid)
-	}
-	users := []User{}
-	if len(allUserIDs) > 0 {
-		userPlaceholders := make([]string, len(allUserIDs))
-		userArgs := make([]interface{}, len(allUserIDs))
-		for i, id := range allUserIDs {
-			userPlaceholders[i] = "?"
-			userArgs[i] = id
-		}
-		userQuery := "SELECT * FROM `users` WHERE `id` IN (" + strings.Join(userPlaceholders, ", ") + ")"
-		if err := db.Select(&users, userQuery, userArgs...); err != nil {
-			return nil, err
-		}
-	}
-	userMap := make(map[int]User)
-	for _, u := range users {
-		userMap[u.ID] = u
-	}
-
-	// コメント数一括取得
-	commentCounts := make(map[int]int)
-	countQuery := "SELECT post_id, COUNT(*) as count FROM `comments` WHERE `post_id` IN (" + strings.Join(placeholders, ", ") + ") GROUP BY post_id"
-	rows, err := db.Queryx(countQuery, args...)
+func makePosts(csrfToken string, postsPerPage int) ([]Post, error) {
+	rows := []postWithCommentRow{}
+	err := db.Select(&rows, postsWithCommentsQuery, postsPerPage)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var postID, count int
-		if err := rows.Scan(&postID, &count); err != nil {
-			return nil, err
+
+	postsMap := make(map[int]*Post)
+	for _, row := range rows {
+		p, ok := postsMap[row.PostID]
+		if !ok {
+			p = &Post{
+				ID:           row.PostID,
+				Body:         row.PostBody,
+				CreatedAt:    row.PostCreatedAt,
+				Mime:         row.PostMime,
+				Imgdata:      row.PostImgdata,
+				UserID:       row.UserID,
+				CSRFToken:    csrfToken,
+				CommentCount: int(row.CommentCount.Int64),
+				User: User{
+					ID:          row.UserID,
+					AccountName: row.UserAccountName,
+					DelFlg:      row.UserDelFlg,
+					Authority:   row.UserAuthority,
+					CreatedAt:   row.UserCreatedAt,
+				},
+			}
+			postsMap[row.PostID] = p
 		}
-		commentCounts[postID] = count
+		if row.CommentID.Valid {
+			c := Comment{
+				ID:        int(row.CommentID.Int64),
+				PostID:    row.PostID,
+				Comment:   row.CommentBody.String,
+				CreatedAt: row.CommentCreatedAt.Time,
+				UserID:    int(row.CommentUserID.Int64),
+				User: User{
+					ID:          int(row.CommentUserID.Int64),
+					AccountName: row.CommentUserAccountName.String,
+					DelFlg:      int(row.CommentUserDelFlg.Int64),
+					Authority:   int(row.CommentUserAuthority.Int64),
+					CreatedAt:   row.CommentUserCreatedAt.Time,
+				},
+			}
+			p.Comments = append(p.Comments, c)
+		}
 	}
 
-	// 投稿IDごとにコメントをまとめる
-	commentsByPost := make(map[int][]Comment)
-	for _, c := range comments {
-		c.User = userMap[c.UserID]
-		commentsByPost[c.PostID] = append(commentsByPost[c.PostID], c)
-	}
-
-	// 投稿ごとに組み立て
-	posts := make([]Post, 0, len(results))
-	for _, p := range results {
-		p.User = userMap[p.UserID]
-		p.CSRFToken = csrfToken
-		p.CommentCount = commentCounts[p.ID]
-		postComments := commentsByPost[p.ID]
-		// 直近3件だけ取得する場合
-		if !allComments && len(postComments) > 3 {
-			postComments = postComments[len(postComments)-3:]
-		}
-		// 昇順に並び替え
-		for i, j := 0, len(postComments)-1; i < j; i, j = i+1, j-1 {
-			postComments[i], postComments[j] = postComments[j], postComments[i]
-		}
-		p.Comments = postComments
+	// del_flg=0のみ返す
+	posts := make([]Post, 0, len(postsMap))
+	for _, p := range postsMap {
 		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
+			posts = append(posts, *p)
 		}
 		if len(posts) >= postsPerPage {
 			break
@@ -453,7 +465,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(getCSRFToken(r), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -499,7 +511,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(getCSRFToken(r), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -587,7 +599,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(getCSRFToken(r), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -623,7 +635,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), true)
+	posts, err := makePosts(getCSRFToken(r), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
