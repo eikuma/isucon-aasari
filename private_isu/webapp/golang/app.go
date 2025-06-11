@@ -172,45 +172,107 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
 
+	// 投稿IDリスト作成
+	postIDs := make([]int, 0, len(results))
+	userIDs := make(map[int]struct{})
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
+		postIDs = append(postIDs, p.ID)
+		userIDs[p.UserID] = struct{}{}
+	}
+
+	// コメント一括取得
+	comments := []Comment{}
+	commentQuery := "SELECT * FROM `comments` WHERE `post_id` IN ("
+	placeholders := make([]string, len(postIDs))
+	args := make([]interface{}, len(postIDs))
+	for i, id := range postIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	commentQuery += strings.Join(placeholders, ", ") + ") ORDER BY `created_at` DESC"
+	if !allComments {
+		// 直近3件だけ取得する場合は、Go側で制御する
+	}
+	if err := db.Select(&comments, commentQuery, args...); err != nil {
+		return nil, err
+	}
+
+	// コメントユーザーIDリスト作成
+	commentUserIDs := make(map[int]struct{})
+	for _, c := range comments {
+		commentUserIDs[c.UserID] = struct{}{}
+	}
+	// 投稿ユーザーIDも含める
+	for uid := range userIDs {
+		commentUserIDs[uid] = struct{}{}
+	}
+
+	// ユーザー一括取得
+	allUserIDs := make([]int, 0, len(commentUserIDs))
+	for uid := range commentUserIDs {
+		allUserIDs = append(allUserIDs, uid)
+	}
+	users := []User{}
+	if len(allUserIDs) > 0 {
+		userPlaceholders := make([]string, len(allUserIDs))
+		userArgs := make([]interface{}, len(allUserIDs))
+		for i, id := range allUserIDs {
+			userPlaceholders[i] = "?"
+			userArgs[i] = id
+		}
+		userQuery := "SELECT * FROM `users` WHERE `id` IN (" + strings.Join(userPlaceholders, ", ") + ")"
+		if err := db.Select(&users, userQuery, userArgs...); err != nil {
 			return nil, err
 		}
+	}
+	userMap := make(map[int]User)
+	for _, u := range users {
+		userMap[u.ID] = u
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
+	// コメント数一括取得
+	commentCounts := make(map[int]int)
+	countQuery := "SELECT post_id, COUNT(*) as count FROM `comments` WHERE `post_id` IN (" + strings.Join(placeholders, ", ") + ") GROUP BY post_id"
+	rows, err := db.Queryx(countQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var postID, count int
+		if err := rows.Scan(&postID, &count); err != nil {
 			return nil, err
 		}
+		commentCounts[postID] = count
+	}
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
+	// 投稿IDごとにコメントをまとめる
+	commentsByPost := make(map[int][]Comment)
+	for _, c := range comments {
+		c.User = userMap[c.UserID]
+		commentsByPost[c.PostID] = append(commentsByPost[c.PostID], c)
+	}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
+	// 投稿ごとに組み立て
+	posts := make([]Post, 0, len(results))
+	for _, p := range results {
+		p.User = userMap[p.UserID]
 		p.CSRFToken = csrfToken
-
+		p.CommentCount = commentCounts[p.ID]
+		postComments := commentsByPost[p.ID]
+		// 直近3件だけ取得する場合
+		if !allComments && len(postComments) > 3 {
+			postComments = postComments[len(postComments)-3:]
+		}
+		// 昇順に並び替え
+		for i, j := 0, len(postComments)-1; i < j; i, j = i+1, j-1 {
+			postComments[i], postComments[j] = postComments[j], postComments[i]
+		}
+		p.Comments = postComments
 		if p.User.DelFlg == 0 {
 			posts = append(posts, p)
 		}
@@ -218,7 +280,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			break
 		}
 	}
-
 	return posts, nil
 }
 
